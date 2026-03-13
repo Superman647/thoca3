@@ -121,10 +121,14 @@ interface PollinationsMessage {
 
 const DEFAULT_TEXT_ENDPOINT = 'https://text.pollinations.ai/openai/v1/chat/completions';
 const TEXT_API_BASE = (import.meta as any).env?.VITE_TEXT_API_BASE as string | undefined;
+const SHOULD_USE_LOCAL_API = (import.meta as any).env?.VITE_USE_LOCAL_API === 'true';
 const TEXT_API_ENDPOINTS = TEXT_API_BASE
   ? [`${TEXT_API_BASE.replace(/\/$/, '')}/openai/v1/chat/completions`]
-  : ['/api/chat', DEFAULT_TEXT_ENDPOINT];
+  : SHOULD_USE_LOCAL_API
+    ? ['/api/chat', DEFAULT_TEXT_ENDPOINT]
+    : [DEFAULT_TEXT_ENDPOINT, '/api/chat'];
 const TEXT_MODELS = ['openai-large', 'openai'];
+const ELEVENLABS_TTS_ENDPOINT = '/api/tts';
 
 export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -148,6 +152,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   
   const initializedRef = useRef(false);
   const convoHistoryRef = useRef<PollinationsMessage[]>([]);
+  const unavailableEndpointsRef = useRef<Set<string>>(new Set());
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -175,25 +180,29 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
     let lastError: unknown;
 
     for (const endpoint of TEXT_API_ENDPOINTS) {
-      for (const model of TEXT_MODELS) {
-        try {
-          const controller = new AbortController();
-          const timeout = window.setTimeout(() => controller.abort(), 25000);
+      if (unavailableEndpointsRef.current.has(endpoint)) continue;
 
+      for (const model of TEXT_MODELS) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort('Text API timeout'), 45000);
+
+        try {
           const response = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model,
               messages: conversation,
-              temperature: 0.7,
+              temperature: 0.5,
             }),
             signal: controller.signal,
           });
-          window.clearTimeout(timeout);
 
           if (!response.ok) {
             const errorText = await response.text();
+            if (response.status === 404 && endpoint.startsWith('/api/')) {
+              unavailableEndpointsRef.current.add(endpoint);
+            }
             throw new Error(`Text API failed (${response.status}, endpoint=${endpoint}, model=${model}): ${errorText}`);
           }
 
@@ -204,8 +213,14 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
           }
 
           return text;
-        } catch (error) {
-          lastError = error;
+        } catch (error: any) {
+          if (error?.name === 'AbortError') {
+            lastError = new Error(`Text API timeout (endpoint=${endpoint}, model=${model})`);
+          } else {
+            lastError = error;
+          }
+        } finally {
+          window.clearTimeout(timeout);
         }
       }
     }
@@ -358,7 +373,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       }
 
       utterance.onend = () => resolve();
-      utterance.onerror = (e) => reject(e.error);
+      utterance.onerror = (e) => reject(new Error(String(e.error || 'Speech synthesis failed')));
       window.speechSynthesis.speak(utterance);
     });
   };
@@ -383,14 +398,33 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   const fetchNextAudio = async () => {
     const task = audioTasks.current.find(t => !t.isFetching && !t.isReady && !t.isFailed);
     if (!task) return;
-    
+
     task.isFetching = true;
     try {
-      task.base64Audio = task.text;
+      const response = await fetch(ELEVENLABS_TTS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: task.text }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`ElevenLabs TTS failed (${response.status}): ${errText}`);
+      }
+
+      const buffer = await response.arrayBuffer();
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.slice(i, i + chunkSize));
+      }
+      task.base64Audio = `data:audio/mpeg;base64,${btoa(binary)}`;
       task.isReady = true;
     } catch (error) {
-      console.error('TTS Fetch Error:', error);
-      task.isFailed = true;
+      console.warn('ElevenLabs TTS unavailable, fallback to browser voice:', error);
+      task.base64Audio = task.text;
+      task.isReady = true;
     } finally {
       task.isFetching = false;
       playNextAudio();
@@ -412,7 +446,16 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       isPlayingAudio.current = true;
       if (task.onStart) task.onStart();
       try {
-        await playBrowserTTS(task.base64Audio);
+        if (task.base64Audio.startsWith('data:audio/')) {
+          await new Promise<void>((resolve, reject) => {
+            const audio = new Audio(task.base64Audio);
+            audio.onended = () => resolve();
+            audio.onerror = () => reject(new Error('Failed to play ElevenLabs audio'));
+            audio.play().catch(reject);
+          });
+        } else {
+          await playBrowserTTS(task.base64Audio);
+        }
       } catch (e) {
         console.error("Play error", e);
       } finally {
