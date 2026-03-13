@@ -4,12 +4,16 @@ import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square,
 import { motion, AnimatePresence } from 'motion/react';
 
 // ── CẤU HÌNH ──────────────────────────────────────────────────────────────
-// Biến môi trường trên Vercel: VITE_BYTEZ_API_KEY, VITE_FPT_API_KEY
-const BYTEZ_API_KEY = (import.meta as any).env?.VITE_BYTEZ_API_KEY || '';
-const FPT_API_KEY = (import.meta as any).env?.VITE_FPT_API_KEY || '';
+// Biến môi trường trên Vercel:
+//   VITE_GEMINI_API_KEY  → aistudio.google.com (free 1500 req/ngày)
+//   VITE_ELEVENLABS_KEY  → elevenlabs.io (free 10k ký tự/tháng)
+const GEMINI_API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || '';
+const ELEVENLABS_KEY = (import.meta as any).env?.VITE_ELEVENLABS_KEY || '';
 
-const BYTEZ_MODEL = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
-const BYTEZ_ENDPOINT = `https://api.bytez.com/models/v2/${BYTEZ_MODEL}`;
+// Giọng ElevenLabs đọc thơ tiếng Việt hay nhất hiện có
+// "uynHFO8tVFOp8MwS5Qhs" = Charlotte (đa ngôn ngữ, giọng ấm)
+// Xem thêm tại: elevenlabs.io/voice-library → lọc "Vietnamese"
+const ELEVENLABS_VOICE_ID = 'uynHFO8tVFOp8MwS5Qhs';
 // ──────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Định vị: Bạn là "Mentor Thẩm mĩ Thơ ca", một chuyên gia Văn học và là người dẫn dắt đầy tính sư phạm. Nhiệm vụ của bạn là hướng dẫn học sinh cấp 3 phát hiện và giải mã tín hiệu thẩm mĩ trong thơ hiện đại dựa trên phương pháp tri giác và tư duy ngôn ngữ nghệ thuật.
@@ -63,120 +67,125 @@ BƯỚC 5: TỔNG KẾT (Summary)
 }
 \`\`\``;
 
-// ─── BYTEZ API HELPERS ────────────────────────────────────────────────────
+// ─── GEMINI API HELPERS ──────────────────────────────────────────────────
 type OAIMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
-/** Gọi Bytez, trả về toàn bộ response (không streaming) */
-async function callBytez(messages: OAIMessage[]): Promise<string> {
-  const res = await fetch(BYTEZ_ENDPOINT, {
+const GEMINI_MODEL = 'gemini-2.0-flash';
+
+/** Chuyển messages (OpenAI format) → Gemini format */
+function toGeminiPayload(messages: OAIMessage[]) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  const chatMsgs  = messages.filter(m => m.role !== 'system');
+  return {
+    ...(systemMsg ? { system_instruction: { parts: [{ text: systemMsg.content }] } } : {}),
+    contents: chatMsgs.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }],
+    })),
+    generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+  };
+}
+
+/** Gọi Gemini, trả về full response */
+async function callGemini(messages: OAIMessage[]): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Authorization': BYTEZ_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages,
-      stream: false,
-      params: { max_new_tokens: 1024, temperature: 0.7 },
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(toGeminiPayload(messages)),
   });
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
   const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  // output có thể là string hoặc array (lấy phần text cuối cùng)
-  const raw = data.output;
-  if (typeof raw === 'string') return raw;
-  if (Array.isArray(raw)) return raw.map((x: any) => x?.generated_text ?? x?.content ?? x ?? '').join('');
-  return String(raw ?? '');
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
-/** Gọi Bytez với streaming, gọi onChunk mỗi khi có token mới */
-async function callBytezStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
-  const res = await fetch(BYTEZ_ENDPOINT, {
+/** Gọi Gemini với streaming */
+async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Authorization': BYTEZ_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages,
-      stream: true,
-      params: { max_new_tokens: 1024, temperature: 0.7 },
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(toGeminiPayload(messages)),
   });
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '', fullText = '';
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
-
     for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data: ')) continue;
-      const payload = trimmed.slice(6).trim();
-      if (payload === '[DONE]' || !payload) continue;
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (!payload) continue;
       try {
-        const parsed = JSON.parse(payload);
-        // Bytez format: { output: "delta" } hoặc OAI format: { choices: [{delta: {content}}] }
-        const delta =
-          parsed?.output ??
-          parsed?.choices?.[0]?.delta?.content ??
-          parsed?.choices?.[0]?.text ??
-          '';
+        const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
         if (delta) { fullText += delta; onChunk(delta); }
-      } catch { /* skip malformed chunk */ }
+      } catch { /* skip */ }
     }
   }
-  // Nếu không có gì từ streaming, fallback sang non-streaming
-  if (!fullText) return callBytez(messages);
   return fullText;
 }
 
-// ─── FPT.AI TTS (tiếng Việt, miễn phí) ──────────────────────────────────
-// Lấy key miễn phí tại: https://console.fpt.ai → Speech → Text to Speech
-// Thêm vào Vercel: VITE_FPT_API_KEY
-// Giọng: banmai (nữ Nam), leminh (nam Nam), thuminh (nữ Bắc), minhquang (nam Bắc)
-const FPT_VOICE = 'banmai';
-
+// ─── ELEVENLABS TTS ──────────────────────────────────────────────────────
 let currentAudio: HTMLAudioElement | null = null;
 
 async function speakVI(text: string, onEnd?: () => void): Promise<void> {
   stopSpeech();
-  const clean = text.replace(/\[.*?\]/g, '').replace(/```[\s\S]*?```/g, '').replace(/[*_#`]/g, '').trim();
+  const clean = text
+    .replace(/\[.*?\]/g, '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/[*_#`]/g, '')
+    .trim();
   if (!clean) { onEnd?.(); return; }
 
-  // Dùng FPT.AI nếu có key
-  if (FPT_API_KEY) {
+  if (ELEVENLABS_KEY) {
     try {
-      const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
-        method: 'POST',
-        headers: {
-          'api-key': FPT_API_KEY,
-          'voice': FPT_VOICE,
-          'speed': '',        // -3 (chậm) đến 3 (nhanh), '' = mặc định
-          'Content-Type': 'application/json',
-        },
-        body: clean,
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.async) {
-          // FPT trả về URL audio, đợi file sẵn rồi phát
-          await new Promise<void>(resolve => setTimeout(resolve, 1200));
-          const audio = new Audio(data.async);
-          currentAudio = audio;
-          audio.onended = () => { currentAudio = null; onEnd?.(); };
-          audio.onerror = () => { currentAudio = null; fallbackSpeak(clean, onEnd); };
-          audio.play();
-          return;
+      const res = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+        {
+          method: 'POST',
+          headers: {
+            'xi-api-key': ELEVENLABS_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: clean,
+            model_id: 'eleven_flash_v2_5',   // nhanh nhất, hỗ trợ tiếng Việt
+            voice_settings: {
+              stability: 0.4,          // thấp hơn = biểu cảm hơn
+              similarity_boost: 0.8,
+              style: 0.35,             // thêm chút phong cách khi đọc
+              use_speaker_boost: true,
+            },
+          }),
         }
+      );
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentAudio = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          currentAudio = null;
+          onEnd?.();
+        };
+        audio.onerror = () => {
+          currentAudio = null;
+          fallbackSpeak(clean, onEnd);
+        };
+        audio.play();
+        return;
       }
     } catch (e) {
-      console.warn('FPT TTS error, fallback to Web Speech', e);
+      console.warn('ElevenLabs TTS error, fallback', e);
     }
   }
-  // Fallback: Web Speech API
   fallbackSpeak(clean, onEnd);
 }
 
@@ -184,7 +193,6 @@ function fallbackSpeak(text: string, onEnd?: () => void) {
   if (!('speechSynthesis' in window)) { onEnd?.(); return; }
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
-  // Tìm giọng tiếng Việt nếu có
   const voices = window.speechSynthesis.getVoices();
   const viVoice = voices.find(v => v.lang.startsWith('vi'));
   if (viVoice) u.voice = viVoice;
@@ -265,7 +273,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
     (async () => {
       try {
         setInitStage('analyzing');
-        const tone = await callBytez([{ role: 'user', content: `Đoạn thơ: "${poem}"
+        const tone = await callGemini([{ role: 'user', content: `Đoạn thơ: "${poem}"
 Tác giả: ${author}
 Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha thiết, bi tráng...). Chỉ trả về các từ, không giải thích.` }]);
         const cleanTone = tone.trim() || 'truyền cảm';
@@ -285,7 +293,7 @@ Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha 
         const firstId = Date.now().toString();
         setMessages(prev => [...prev, { id: firstId, role: 'model', text: '' }]);
         let full = '';
-        await callBytezStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+        await callGeminiStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
           full += d;
           const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
           setMessages(p => p.map(m => m.id === firstId ? { ...m, text: disp } : m));
@@ -294,7 +302,7 @@ Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha 
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
         let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
-        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ BYTEZ_API_KEY không hợp lệ. Kiểm tra biến VITE_BYTEZ_API_KEY trên Vercel.';
+        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ Gemini API key không hợp lệ. Kiểm tra VITE_GEMINI_API_KEY trên Vercel.';
         if (e?.status === 429 || e?.message?.includes('429')) msg = '⏳ Rate limit. Vui lòng thử lại sau ít phút.';
         setMessages([{ id: 'err', role: 'model', text: msg }]);
       } finally { setIsLoading(false); }
@@ -311,7 +319,7 @@ Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha 
       setMessages(prev => [...prev, { id: modelId, role: 'model', text: '' }]);
       setIsLoading(false);
       let full = '';
-      await callBytezStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+      await callGeminiStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
         full += d;
         const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
         setMessages(p => p.map(m => m.id === modelId ? { ...m, text: disp } : m));
