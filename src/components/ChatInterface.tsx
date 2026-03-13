@@ -14,15 +14,15 @@ const OPENROUTER_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
 const ELEVENLABS_KEY = (import.meta as any).env?.VITE_ELEVENLABS_KEY || '';
 
 const FREE_MODELS = [
-  'deepseek/deepseek-chat:free',             // Rất mạnh, hiểu tiếng Việt sâu
-  'google/gemini-2.0-flash-exp:free',        // Nhanh, tốt cho hướng dẫn
-  'meta-llama/llama-3.3-70b-instruct:free',  // Dự phòng ổn định
+  'google/gemma-3-27b-it:free',   // Mạnh nhất trong bộ, hiểu tiếng Việt tốt
+  'openai/gpt-oss-120b:free',     // Dự phòng mạnh
+  'google/gemma-3-12b-it:free',   // Nhẹ hơn, fallback cuối
 ];
 
 // Track model hiện tại để xoay khi bị lỗi
 let modelIndex = 0;
 
-const ELEVENLABS_VOICE_ID = 'uynHFO8tVFOp8MwS5Qhs';
+const ELEVENLABS_VOICE_ID = 'oN0q7mZB5kootbGrbqix';
 // ──────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Định vị: Bạn là "Mentor Thẩm mĩ Thơ ca", một chuyên gia Văn học và là người dẫn dắt đầy tính sư phạm. Nhiệm vụ của bạn là hướng dẫn học sinh cấp 3 phát hiện và giải mã tín hiệu thẩm mĩ trong thơ hiện đại dựa trên phương pháp tri giác và tư duy ngôn ngữ nghệ thuật.
