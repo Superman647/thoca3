@@ -4,35 +4,24 @@ import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square,
 import { motion, AnimatePresence } from 'motion/react';
 
 // ── CẤU HÌNH ──────────────────────────────────────────────────────────────
-// Thêm nhiều key để xoay vòng khi bị rate limit (không cần đợi):
-//   VITE_GEMINI_API_KEY   → key chính
-//   VITE_GEMINI_API_KEY_2 → key dự phòng 1
-//   VITE_GEMINI_API_KEY_3 → key dự phòng 2
-//   (tạo thêm tại aistudio.google.com bằng nhiều tài khoản Google)
+// Chỉ cần 1 key OpenRouter duy nhất → openrouter.ai/keys
+// Biến môi trường trên Vercel: VITE_OPENROUTER_API_KEY
+//
+// Khi một model bị rate limit / overloaded → tự động chuyển model tiếp theo
+// Thứ tự ưu tiên: DeepSeek V3 → Gemini 2.0 Flash → Llama 3.3 70B
+// (đều free, đều mạnh, hỗ trợ tiếng Việt tốt)
+const OPENROUTER_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
 const ELEVENLABS_KEY = (import.meta as any).env?.VITE_ELEVENLABS_KEY || '';
 
-const GEMINI_KEYS: string[] = [
-  (import.meta as any).env?.VITE_GEMINI_API_KEY,
-  (import.meta as any).env?.VITE_GEMINI_API_KEY_2,
-  (import.meta as any).env?.VITE_GEMINI_API_KEY_3,
-].filter(Boolean);
+const FREE_MODELS = [
+  'deepseek/deepseek-chat-v3-0324:free',   // Rất mạnh, hiểu tiếng Việt sâu
+  'google/gemini-2.0-flash-exp:free',       // Nhanh, tốt cho hướng dẫn
+  'meta-llama/llama-3.3-70b-instruct:free', // Dự phòng ổn định
+];
 
-// Index key đang dùng — xoay vòng khi bị 429
-let currentKeyIndex = 0;
-function getNextKey(): string | null {
-  const tried = new Set<number>();
-  while (tried.size < GEMINI_KEYS.length) {
-    currentKeyIndex = (currentKeyIndex + 1) % GEMINI_KEYS.length;
-    if (!tried.has(currentKeyIndex)) return GEMINI_KEYS[currentKeyIndex];
-    tried.add(currentKeyIndex);
-  }
-  return null; // tất cả keys đều bị rate limit
-}
-function getCurrentKey(): string { return GEMINI_KEYS[currentKeyIndex] || ''; }
+// Track model hiện tại để xoay khi bị lỗi
+let modelIndex = 0;
 
-// Giọng ElevenLabs đọc thơ tiếng Việt hay nhất hiện có
-// "uynHFO8tVFOp8MwS5Qhs" = Charlotte (đa ngôn ngữ, giọng ấm)
-// Xem thêm tại: elevenlabs.io/voice-library → lọc "Vietnamese"
 const ELEVENLABS_VOICE_ID = 'uynHFO8tVFOp8MwS5Qhs';
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -87,83 +76,64 @@ BƯỚC 5: TỔNG KẾT (Summary)
 }
 \`\`\``;
 
-// ─── GEMINI API HELPERS ──────────────────────────────────────────────────
+// ─── OPENROUTER API ───────────────────────────────────────────────────────
 type OAIMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+/**
+ * Gọi OpenRouter với model rotation tự động.
+ * Nếu model hiện tại bị 429/503/overloaded → thử model tiếp theo ngay, không delay.
+ * Chỉ throw khi tất cả models đều thất bại.
+ */
+async function callStream(
+  messages: OAIMessage[],
+  onChunk: (delta: string) => void
+): Promise<string> {
+  let attempts = 0;
 
-/** Chuyển messages (OpenAI format) → Gemini format */
-function toGeminiPayload(messages: OAIMessage[]) {
-  const systemMsg = messages.find(m => m.role === 'system');
-  const chatMsgs  = messages.filter(m => m.role !== 'system');
-  return {
-    ...(systemMsg ? { system_instruction: { parts: [{ text: systemMsg.content }] } } : {}),
-    contents: chatMsgs.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    })),
-    generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
-  };
-}
+  while (attempts < FREE_MODELS.length) {
+    const model = FREE_MODELS[modelIndex];
+    attempts++;
 
-/** Gọi Gemini — tự xoay key khi bị 429, không delay */
-async function callGemini(messages: OAIMessage[]): Promise<string> {
-  const triedKeys = new Set<string>();
-  let key = getCurrentKey();
-  while (key && !triedKeys.has(key)) {
-    triedKeys.add(key);
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
-      const res = await fetch(url, {
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(toGeminiPayload(messages)),
+        headers: {
+          'Authorization': `Bearer ${OPENROUTER_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': window.location.origin,
+          'X-Title': 'Mentor Tho Ca',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: true,
+          max_tokens: 1024,
+          temperature: 0.7,
+        }),
       });
-      if (res.status === 429 || res.status === 503) {
-        // key này bị giới hạn → thử key tiếp theo ngay
-        const next = getNextKey();
-        if (!next || triedKeys.has(next)) break;
-        key = next;
+
+      // Model bị rate limit hoặc quá tải → chuyển model ngay, không delay
+      if (res.status === 429 || res.status === 503 || res.status === 502) {
+        console.warn(`[OpenRouter] Model "${model}" bị giới hạn (${res.status}), chuyển sang model tiếp...`);
+        modelIndex = (modelIndex + 1) % FREE_MODELS.length;
         continue;
       }
-      if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
-      const data = await res.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } catch (e: any) {
-      if (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED')) {
-        const next = getNextKey();
-        if (!next || triedKeys.has(next)) break;
-        key = next;
-      } else throw e;
-    }
-  }
-  throw Object.assign(new Error('Tất cả API key đều đang bị rate limit. Vui lòng thêm key hoặc thử lại sau ít phút.'), { status: 429 });
-}
 
-/** Gọi Gemini streaming — tự xoay key khi bị 429, không delay */
-async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
-  const triedKeys = new Set<string>();
-  let key = getCurrentKey();
-  while (key && !triedKeys.has(key)) {
-    triedKeys.add(key);
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${key}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(toGeminiPayload(messages)),
-      });
-      if (res.status === 429 || res.status === 503) {
-        const next = getNextKey();
-        if (!next || triedKeys.has(next)) break;
-        key = next;
-        continue;
+      if (!res.ok) {
+        const errText = await res.text();
+        if (errText.includes('overloaded') || errText.includes('rate') || errText.includes('limit')) {
+          console.warn(`[OpenRouter] Model "${model}" overloaded, chuyển sang model tiếp...`);
+          modelIndex = (modelIndex + 1) % FREE_MODELS.length;
+          continue;
+        }
+        throw Object.assign(new Error(errText), { status: res.status });
       }
-      if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
 
+      // Stream thành công — đọc SSE
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = '', fullText = '';
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -173,26 +143,26 @@ async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string)
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
           const payload = line.slice(6).trim();
-          if (!payload) continue;
+          if (!payload || payload === '[DONE]') continue;
           try {
-            const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
+            const delta = JSON.parse(payload).choices?.[0]?.delta?.content || '';
             if (delta) { fullText += delta; onChunk(delta); }
-          } catch { /* skip */ }
+          } catch { /* skip malformed chunks */ }
         }
       }
       return fullText;
+
     } catch (e: any) {
-      if (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED')) {
-        const next = getNextKey();
-        if (!next || triedKeys.has(next)) break;
-        key = next;
-      } else throw e;
+      if (e?.status && e.status !== 429 && e.status !== 503 && e.status !== 502) throw e;
+      console.warn(`[OpenRouter] Lỗi model "${FREE_MODELS[modelIndex]}":`, e?.message);
+      modelIndex = (modelIndex + 1) % FREE_MODELS.length;
     }
   }
-  throw Object.assign(new Error('Tất cả API key đều đang bị rate limit. Vui lòng thêm key hoặc thử lại sau ít phút.'), { status: 429 });
+
+  throw new Error('Tất cả models đều đang bận. Vui lòng thử lại sau vài giây.');
 }
 
-// ─── ELEVENLABS TTS ──────────────────────────────────────────────────────
+// ─── ELEVENLABS TTS ───────────────────────────────────────────────────────
 let currentAudio: HTMLAudioElement | null = null;
 
 async function speakVI(text: string, onEnd?: () => void): Promise<void> {
@@ -210,19 +180,11 @@ async function speakVI(text: string, onEnd?: () => void): Promise<void> {
         `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
         {
           method: 'POST',
-          headers: {
-            'xi-api-key': ELEVENLABS_KEY,
-            'Content-Type': 'application/json',
-          },
+          headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             text: clean,
-            model_id: 'eleven_flash_v2_5',   // nhanh nhất, hỗ trợ tiếng Việt
-            voice_settings: {
-              stability: 0.4,          // thấp hơn = biểu cảm hơn
-              similarity_boost: 0.8,
-              style: 0.35,             // thêm chút phong cách khi đọc
-              use_speaker_boost: true,
-            },
+            model_id: 'eleven_flash_v2_5',
+            voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0.35, use_speaker_boost: true },
           }),
         }
       );
@@ -231,21 +193,12 @@ async function speakVI(text: string, onEnd?: () => void): Promise<void> {
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         currentAudio = audio;
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          currentAudio = null;
-          onEnd?.();
-        };
-        audio.onerror = () => {
-          currentAudio = null;
-          fallbackSpeak(clean, onEnd);
-        };
+        audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; onEnd?.(); };
+        audio.onerror = () => { currentAudio = null; fallbackSpeak(clean, onEnd); };
         audio.play();
         return;
       }
-    } catch (e) {
-      console.warn('ElevenLabs TTS error, fallback', e);
-    }
+    } catch (e) { console.warn('ElevenLabs TTS error, fallback', e); }
   }
   fallbackSpeak(clean, onEnd);
 }
@@ -336,10 +289,9 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       try {
         setInitStage('analyzing');
 
-        // ── GỘP 2 CALLS THÀNH 1 để tránh rate limit ──────────────────────
-        // System prompt yêu cầu dòng đầu là "GIỌNG_ĐIỆU: <tone>" rồi "---"
+        // 1 call duy nhất: AI trả GIỌNG_ĐIỆU ở dòng đầu rồi bắt đầu BƯỚC 1 ngay
         const combinedSystem = SYSTEM_PROMPT +
-          `\n\nQUY TẮC QUAN TRỌNG CHO PHẢN HỒI ĐẦU TIÊN: Dòng đầu tiên BẮT BUỘC là "GIỌNG_ĐIỆU: <1-3 từ>" rồi dòng "---" rồi mới bắt đầu BƯỚC 1. Ví dụ:\nGIỌNG_ĐIỆU: tha thiết, bâng khuâng\n---\n(nội dung BƯỚC 1...)`;
+          `\n\nQUY TẮC BẮT BUỘC CHO PHẢN HỒI ĐẦU TIÊN: Dòng đầu tiên PHẢI là "GIỌNG_ĐIỆU: <1-3 từ>" rồi dòng "---" rồi mới bắt đầu BƯỚC 1.\nVí dụ:\nGIỌNG_ĐIỆU: tha thiết, bâng khuâng\n---\n(nội dung BƯỚC 1...)`;
 
         const initMsg: OAIMessage = { role: 'user', content: `Đoạn thơ: ${poem}\nTác giả: ${author}\nHãy bắt đầu BƯỚC 1.` };
         chatHistoryRef.current = [initMsg];
@@ -348,10 +300,9 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
 
         let full = '';
         let toneHandled = false;
-        await callGeminiStream([{ role: 'system', content: combinedSystem }, ...chatHistoryRef.current], d => {
+        await callStream([{ role: 'system', content: combinedSystem }, ...chatHistoryRef.current], d => {
           full += d;
 
-          // Khi stream đủ để trích tone → chuyển sang stage 'reading' + đọc thơ
           if (!toneHandled) {
             const toneMatch = full.match(/GIỌNG_ĐIỆU:\s*([^\n]+)/);
             if (toneMatch) {
@@ -366,19 +317,19 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
             }
           }
 
-          // Ẩn dòng GIỌNG_ĐIỆU + "---" khỏi chat
           const disp = full
             .replace(/GIỌNG_ĐIỆU:[^\n]*\n---\n?/g, '')
             .replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
           setMessages(p => p.map(m => m.id === firstId ? { ...m, text: disp } : m));
           parseMarkup(full);
         });
+
         if (!toneHandled) setInitStage('ready');
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
-        let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
-        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ Gemini API key không hợp lệ. Kiểm tra VITE_GEMINI_API_KEY trên Vercel.';
-        if (e?.status === 429 || e?.message?.includes('429')) msg = '⏳ Rate limit. Vui lòng thử lại sau ít phút.';
+        let msg = '❌ Lỗi khởi tạo. Vui lòng thử lại.';
+        if (e?.status === 401) msg = '❌ OpenRouter API key không hợp lệ. Kiểm tra VITE_OPENROUTER_API_KEY trên Vercel.';
+        if (e?.message?.includes('bận')) msg = '⏳ Các model đang bận, vui lòng thử lại sau vài giây.';
         setMessages([{ id: 'err', role: 'model', text: msg }]);
       } finally { setIsLoading(false); }
     })();
@@ -394,7 +345,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       setMessages(prev => [...prev, { id: modelId, role: 'model', text: '' }]);
       setIsLoading(false);
       let full = '';
-      await callGeminiStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+      await callStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
         full += d;
         const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
         setMessages(p => p.map(m => m.id === modelId ? { ...m, text: disp } : m));
@@ -402,8 +353,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       });
       chatHistoryRef.current.push({ role: 'assistant', content: full });
     } catch (e: any) {
-      let msg = 'Không thể trả lời lúc này. Vui lòng thử lại.';
-      if (e?.status === 429) msg = '⏳ Đang tải lại (rate limit)... vui lòng chờ.';
+      const msg = '⚠️ Không thể trả lời lúc này. Vui lòng thử lại.';
       setMessages(p => [...p, { id: (Date.now() + 1).toString(), role: 'model', text: msg }]);
       chatHistoryRef.current.pop();
       setIsLoading(false);
