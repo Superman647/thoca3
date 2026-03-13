@@ -4,11 +4,31 @@ import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square,
 import { motion, AnimatePresence } from 'motion/react';
 
 // ── CẤU HÌNH ──────────────────────────────────────────────────────────────
-// Biến môi trường trên Vercel:
-//   VITE_GEMINI_API_KEY  → aistudio.google.com (free 1500 req/ngày)
-//   VITE_ELEVENLABS_KEY  → elevenlabs.io (free 10k ký tự/tháng)
-const GEMINI_API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || '';
+// Thêm nhiều key để xoay vòng khi bị rate limit (không cần đợi):
+//   VITE_GEMINI_API_KEY   → key chính
+//   VITE_GEMINI_API_KEY_2 → key dự phòng 1
+//   VITE_GEMINI_API_KEY_3 → key dự phòng 2
+//   (tạo thêm tại aistudio.google.com bằng nhiều tài khoản Google)
 const ELEVENLABS_KEY = (import.meta as any).env?.VITE_ELEVENLABS_KEY || '';
+
+const GEMINI_KEYS: string[] = [
+  (import.meta as any).env?.VITE_GEMINI_API_KEY,
+  (import.meta as any).env?.VITE_GEMINI_API_KEY_2,
+  (import.meta as any).env?.VITE_GEMINI_API_KEY_3,
+].filter(Boolean);
+
+// Index key đang dùng — xoay vòng khi bị 429
+let currentKeyIndex = 0;
+function getNextKey(): string | null {
+  const tried = new Set<number>();
+  while (tried.size < GEMINI_KEYS.length) {
+    currentKeyIndex = (currentKeyIndex + 1) % GEMINI_KEYS.length;
+    if (!tried.has(currentKeyIndex)) return GEMINI_KEYS[currentKeyIndex];
+    tried.add(currentKeyIndex);
+  }
+  return null; // tất cả keys đều bị rate limit
+}
+function getCurrentKey(): string { return GEMINI_KEYS[currentKeyIndex] || ''; }
 
 // Giọng ElevenLabs đọc thơ tiếng Việt hay nhất hiện có
 // "uynHFO8tVFOp8MwS5Qhs" = Charlotte (đa ngôn ngữ, giọng ấm)
@@ -86,64 +106,90 @@ function toGeminiPayload(messages: OAIMessage[]) {
   };
 }
 
-/** Retry tự động khi bị rate limit (429) */
-async function withRetry<T>(fn: () => Promise<T>, retries = 4, delay = 2000): Promise<T> {
-  try { return await fn(); } catch (e: any) {
-    if (retries > 0 && (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED'))) {
-      await new Promise(r => setTimeout(r, delay));
-      return withRetry(fn, retries - 1, delay * 1.5);
-    }
-    throw e;
-  }
-}
-
-/** Gọi Gemini, trả về full response */
+/** Gọi Gemini — tự xoay key khi bị 429, không delay */
 async function callGemini(messages: OAIMessage[]): Promise<string> {
-  return withRetry(async () => {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(toGeminiPayload(messages)),
-    });
-    if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  });
+  const triedKeys = new Set<string>();
+  let key = getCurrentKey();
+  while (key && !triedKeys.has(key)) {
+    triedKeys.add(key);
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(toGeminiPayload(messages)),
+      });
+      if (res.status === 429 || res.status === 503) {
+        // key này bị giới hạn → thử key tiếp theo ngay
+        const next = getNextKey();
+        if (!next || triedKeys.has(next)) break;
+        key = next;
+        continue;
+      }
+      if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch (e: any) {
+      if (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED')) {
+        const next = getNextKey();
+        if (!next || triedKeys.has(next)) break;
+        key = next;
+      } else throw e;
+    }
+  }
+  throw Object.assign(new Error('Tất cả API key đều đang bị rate limit. Vui lòng thêm key hoặc thử lại sau ít phút.'), { status: 429 });
 }
 
-/** Gọi Gemini với streaming (retry tự động nếu rate limit) */
+/** Gọi Gemini streaming — tự xoay key khi bị 429, không delay */
 async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
-  return withRetry(async () => {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(toGeminiPayload(messages)),
-    });
-    if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
-
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '', fullText = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6).trim();
-        if (!payload) continue;
-        try {
-          const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
-          if (delta) { fullText += delta; onChunk(delta); }
-        } catch { /* skip */ }
+  const triedKeys = new Set<string>();
+  let key = getCurrentKey();
+  while (key && !triedKeys.has(key)) {
+    triedKeys.add(key);
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${key}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(toGeminiPayload(messages)),
+      });
+      if (res.status === 429 || res.status === 503) {
+        const next = getNextKey();
+        if (!next || triedKeys.has(next)) break;
+        key = next;
+        continue;
       }
+      if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', fullText = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6).trim();
+          if (!payload) continue;
+          try {
+            const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
+            if (delta) { fullText += delta; onChunk(delta); }
+          } catch { /* skip */ }
+        }
+      }
+      return fullText;
+    } catch (e: any) {
+      if (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED')) {
+        const next = getNextKey();
+        if (!next || triedKeys.has(next)) break;
+        key = next;
+      } else throw e;
     }
-    return fullText;
-  });
+  }
+  throw Object.assign(new Error('Tất cả API key đều đang bị rate limit. Vui lòng thêm key hoặc thử lại sau ít phút.'), { status: 429 });
 }
 
 // ─── ELEVENLABS TTS ──────────────────────────────────────────────────────
@@ -289,51 +335,45 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
     (async () => {
       try {
         setInitStage('analyzing');
-        const tone = await callGemini([{ role: 'user', content: `Đoạn thơ: "${poem}"
-Tác giả: ${author}
-Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha thiết, bi tráng...). Chỉ trả về các từ, không giải thích.` }]);
-        const cleanTone = tone.trim() || 'truyền cảm';
-        setPoemTone(cleanTone);
 
-        setInitStage('reading');
-        setMessages([{ id: 'sys-reading', role: 'model', text: `*Đã phân tích giọng điệu: **${cleanTone}**. Đang đọc đoạn thơ...*` }]);
-        await new Promise<void>(resolve => {
-          setReadingPoemLine(-1);
-          speakVI(poem, () => { setReadingPoemLine(null); resolve(); });
-          setTimeout(resolve, poem.length * 80 + 3000);
-        });
+        // ── GỘP 2 CALLS THÀNH 1 để tránh rate limit ──────────────────────
+        // System prompt yêu cầu dòng đầu là "GIỌNG_ĐIỆU: <tone>" rồi "---"
+        const combinedSystem = SYSTEM_PROMPT +
+          `\n\nQUY TẮC QUAN TRỌNG CHO PHẢN HỒI ĐẦU TIÊN: Dòng đầu tiên BẮT BUỘC là "GIỌNG_ĐIỆU: <1-3 từ>" rồi dòng "---" rồi mới bắt đầu BƯỚC 1. Ví dụ:\nGIỌNG_ĐIỆU: tha thiết, bâng khuâng\n---\n(nội dung BƯỚC 1...)`;
 
-        setInitStage('ready');
         const initMsg: OAIMessage = { role: 'user', content: `Đoạn thơ: ${poem}\nTác giả: ${author}\nHãy bắt đầu BƯỚC 1.` };
         chatHistoryRef.current = [initMsg];
         const firstId = Date.now().toString();
-        setMessages(prev => [...prev, { id: firstId, role: 'model', text: '' }]);
+        setMessages([{ id: firstId, role: 'model', text: '' }]);
+
         let full = '';
-        await callGeminiStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+        let toneHandled = false;
+        await callGeminiStream([{ role: 'system', content: combinedSystem }, ...chatHistoryRef.current], d => {
           full += d;
-          // Trích tone từ dòng "GIỌNG_ĐIỆU: ..." ở đầu response
-          if (!poemToneExtracted.current) {
+
+          // Khi stream đủ để trích tone → chuyển sang stage 'reading' + đọc thơ
+          if (!toneHandled) {
             const toneMatch = full.match(/GIỌNG_ĐIỆU:\s*([^\n]+)/);
             if (toneMatch) {
               const t = toneMatch[1].trim();
               setPoemTone(t);
               poemToneExtracted.current = true;
+              toneHandled = true;
               setInitStage('reading');
               setMessages([{ id: 'sys-reading', role: 'model', text: `*Đã phân tích giọng điệu: **${t}**. Đang đọc đoạn thơ...*` }]);
-              // Đọc thơ song song trong khi AI tiếp tục stream
-              speakVI(poem, () => setReadingPoemLine(null));
+              speakVI(poem, () => { setReadingPoemLine(null); setInitStage('ready'); });
               setReadingPoemLine(-1);
-              setTimeout(() => setInitStage('ready'), 500);
             }
           }
-          // Bỏ dòng GIỌNG_ĐIỆU khỏi hiển thị chat
+
+          // Ẩn dòng GIỌNG_ĐIỆU + "---" khỏi chat
           const disp = full
-            .replace(/GIỌNG_ĐIỆU:.*\n---\n?/g, '')
+            .replace(/GIỌNG_ĐIỆU:[^\n]*\n---\n?/g, '')
             .replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
           setMessages(p => p.map(m => m.id === firstId ? { ...m, text: disp } : m));
           parseMarkup(full);
         });
-        if (!poemToneExtracted.current) setInitStage('ready');
+        if (!toneHandled) setInitStage('ready');
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
         let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
