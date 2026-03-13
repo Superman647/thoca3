@@ -14,9 +14,9 @@ const OPENROUTER_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
 const ELEVENLABS_KEY = (import.meta as any).env?.VITE_ELEVENLABS_KEY || '';
 
 const FREE_MODELS = [
-  'deepseek/deepseek-chat-v3-0324:free',   // Rất mạnh, hiểu tiếng Việt sâu
-  'google/gemini-2.0-flash-exp:free',       // Nhanh, tốt cho hướng dẫn
-  'meta-llama/llama-3.3-70b-instruct:free', // Dự phòng ổn định
+  'deepseek/deepseek-chat:free',             // Rất mạnh, hiểu tiếng Việt sâu
+  'google/gemini-2.0-flash-exp:free',        // Nhanh, tốt cho hướng dẫn
+  'meta-llama/llama-3.3-70b-instruct:free',  // Dự phòng ổn định
 ];
 
 // Track model hiện tại để xoay khi bị lỗi
