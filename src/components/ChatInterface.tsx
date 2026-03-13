@@ -3,12 +3,9 @@ import Markdown from 'react-markdown';
 import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square, Activity, Lightbulb, Feather } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-// ─── CẤU HÌNH OPENROUTER ─────────────────────────────────────────────────
-// Dán API key vào VITE_OPENROUTER_API_KEY trong file .env
-const OPENROUTER_API_KEY =
-  (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
+// API key đọc từ biến môi trường Vercel (VITE_OPENROUTER_API_KEY)
+const OPENROUTER_API_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
 const CHAT_MODEL = 'google/gemma-3-27b-it:free';
-// ─────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Định vị: Bạn là "Mentor Thẩm mĩ Thơ ca", một chuyên gia Văn học và là người dẫn dắt đầy tính sư phạm. Nhiệm vụ của bạn là hướng dẫn học sinh cấp 3 phát hiện và giải mã tín hiệu thẩm mĩ trong thơ hiện đại dựa trên phương pháp tri giác và tư duy ngôn ngữ nghệ thuật.
 
@@ -225,7 +222,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
         let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
-        if (e?.status === 401) msg = '❌ API key không hợp lệ. Kiểm tra VITE_OPENROUTER_API_KEY trong .env';
+        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ API key không hợp lệ. Vui lòng kiểm tra lại key trên openrouter.ai/keys';
         if (e?.status === 429 || e?.message?.includes('429')) msg = '⏳ Rate limit. Vui lòng thử lại sau ít phút.';
         setMessages([{ id: 'err', role: 'model', text: msg }]);
       } finally { setIsLoading(false); }

@@ -1,8 +1,3 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
 import React, { useState } from 'react';
 import { PoemInput } from './components/PoemInput';
 import { ChatInterface } from './components/ChatInterface';
@@ -28,11 +23,10 @@ export default function App() {
       ) : (
         <ChatInterface 
           poem={poemData.poem} 
-          author={poemData.author} 
+          author={poemData.author}
           onBack={handleBack} 
         />
       )}
     </div>
   );
 }
-

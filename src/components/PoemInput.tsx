@@ -51,7 +51,7 @@ export function PoemInput({ onSubmit }: PoemInputProps) {
               id="poem"
               value={poem}
               onChange={(e) => setPoem(e.target.value)}
-              placeholder="Dốc lên khúc khuỷu dốc thăm thẳm&#10;Heo hút cồn mây súng ngửi trời..."
+              placeholder={"Dốc lên khúc khuỷu dốc thăm thẳm\nHeo hút cồn mây súng ngửi trời..."}
               rows={6}
               className="w-full px-4 py-3 rounded-xl border border-[#e0e0d8] bg-[#fafafa] focus:outline-none focus:ring-2 focus:ring-[#5A5A40] focus:border-transparent transition-all font-serif text-lg resize-none"
               required
