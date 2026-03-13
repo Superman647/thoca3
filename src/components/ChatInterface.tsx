@@ -86,49 +86,64 @@ function toGeminiPayload(messages: OAIMessage[]) {
   };
 }
 
-/** Gọi Gemini, trả về full response */
-async function callGemini(messages: OAIMessage[]): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(toGeminiPayload(messages)),
-  });
-  if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+/** Retry tự động khi bị rate limit (429) */
+async function withRetry<T>(fn: () => Promise<T>, retries = 4, delay = 2000): Promise<T> {
+  try { return await fn(); } catch (e: any) {
+    if (retries > 0 && (e?.status === 429 || e?.message?.includes('429') || e?.message?.includes('RESOURCE_EXHAUSTED'))) {
+      await new Promise(r => setTimeout(r, delay));
+      return withRetry(fn, retries - 1, delay * 1.5);
+    }
+    throw e;
+  }
 }
 
-/** Gọi Gemini với streaming */
-async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(toGeminiPayload(messages)),
+/** Gọi Gemini, trả về full response */
+async function callGemini(messages: OAIMessage[]): Promise<string> {
+  return withRetry(async () => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toGeminiPayload(messages)),
+    });
+    if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
   });
-  if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
+}
 
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '', fullText = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const payload = line.slice(6).trim();
-      if (!payload) continue;
-      try {
-        const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (delta) { fullText += delta; onChunk(delta); }
-      } catch { /* skip */ }
+/** Gọi Gemini với streaming (retry tự động nếu rate limit) */
+async function callGeminiStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
+  return withRetry(async () => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toGeminiPayload(messages)),
+    });
+    if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '', fullText = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (!payload) continue;
+        try {
+          const delta = JSON.parse(payload).candidates?.[0]?.content?.parts?.[0]?.text || '';
+          if (delta) { fullText += delta; onChunk(delta); }
+        } catch { /* skip */ }
+      }
     }
-  }
-  return fullText;
+    return fullText;
+  });
 }
 
 // ─── ELEVENLABS TTS ──────────────────────────────────────────────────────
@@ -229,6 +244,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   const [summaryData, setSummaryData] = useState<SummaryData | null>(null);
   const [rhythmLines, setRhythmLines] = useState<string[]>([]);
   const initializedRef = useRef(false);
+  const poemToneExtracted = useRef(false);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length, isLoading, initStage]);
   useEffect(() => { if (readingPoemLine !== null) activePoemLineRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [readingPoemLine]);
@@ -295,10 +311,29 @@ Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha 
         let full = '';
         await callGeminiStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
           full += d;
-          const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
+          // Trích tone từ dòng "GIỌNG_ĐIỆU: ..." ở đầu response
+          if (!poemToneExtracted.current) {
+            const toneMatch = full.match(/GIỌNG_ĐIỆU:\s*([^\n]+)/);
+            if (toneMatch) {
+              const t = toneMatch[1].trim();
+              setPoemTone(t);
+              poemToneExtracted.current = true;
+              setInitStage('reading');
+              setMessages([{ id: 'sys-reading', role: 'model', text: `*Đã phân tích giọng điệu: **${t}**. Đang đọc đoạn thơ...*` }]);
+              // Đọc thơ song song trong khi AI tiếp tục stream
+              speakVI(poem, () => setReadingPoemLine(null));
+              setReadingPoemLine(-1);
+              setTimeout(() => setInitStage('ready'), 500);
+            }
+          }
+          // Bỏ dòng GIỌNG_ĐIỆU khỏi hiển thị chat
+          const disp = full
+            .replace(/GIỌNG_ĐIỆU:.*\n---\n?/g, '')
+            .replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
           setMessages(p => p.map(m => m.id === firstId ? { ...m, text: disp } : m));
           parseMarkup(full);
         });
+        if (!poemToneExtracted.current) setInitStage('ready');
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
         let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
@@ -328,7 +363,7 @@ Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha 
       chatHistoryRef.current.push({ role: 'assistant', content: full });
     } catch (e: any) {
       let msg = 'Không thể trả lời lúc này. Vui lòng thử lại.';
-      if (e?.status === 429) msg = '⏳ Đang bận, vui lòng thử lại sau ít phút.';
+      if (e?.status === 429) msg = '⏳ Đang tải lại (rate limit)... vui lòng chờ.';
       setMessages(p => [...p, { id: (Date.now() + 1).toString(), role: 'model', text: msg }]);
       chatHistoryRef.current.pop();
       setIsLoading(false);
