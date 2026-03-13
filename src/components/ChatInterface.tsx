@@ -4,16 +4,12 @@ import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square,
 import { motion, AnimatePresence } from 'motion/react';
 
 // ── CẤU HÌNH ──────────────────────────────────────────────────────────────
-// Biến môi trường trên Vercel: VITE_OPENROUTER_API_KEY, VITE_FPT_API_KEY
-const OPENROUTER_API_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
+// Biến môi trường trên Vercel: VITE_BYTEZ_API_KEY, VITE_FPT_API_KEY
+const BYTEZ_API_KEY = (import.meta as any).env?.VITE_BYTEZ_API_KEY || '';
 const FPT_API_KEY = (import.meta as any).env?.VITE_FPT_API_KEY || '';
 
-// Model chính: DeepSeek R1 (reasoning, phân tích sắc sảo)
-// Fallback: Llama 3.3 70B khi bị rate limit
-const CHAT_MODELS = [
-  'deepseek/deepseek-r1:free',
-  'meta-llama/llama-3.3-70b-instruct:free',
-];
+const BYTEZ_MODEL = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
+const BYTEZ_ENDPOINT = `https://api.bytez.com/models/v2/${BYTEZ_MODEL}`;
 // ──────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Định vị: Bạn là "Mentor Thẩm mĩ Thơ ca", một chuyên gia Văn học và là người dẫn dắt đầy tính sư phạm. Nhiệm vụ của bạn là hướng dẫn học sinh cấp 3 phát hiện và giải mã tín hiệu thẩm mĩ trong thơ hiện đại dựa trên phương pháp tri giác và tư duy ngôn ngữ nghệ thuật.
@@ -67,72 +63,73 @@ BƯỚC 5: TỔNG KẾT (Summary)
 }
 \`\`\``;
 
-// ─── OPENROUTER HELPERS ───────────────────────────────────────────────────
+// ─── BYTEZ API HELPERS ────────────────────────────────────────────────────
 type OAIMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, baseDelay = 1000): Promise<T> {
-  let attempt = 0;
-  while (attempt < maxRetries) {
-    try { return await fn(); } catch (error: any) {
-      attempt++;
-      const msg = error?.message || '';
-      const retry = error?.status === 429 || error?.status >= 500 || msg.includes('429') || msg.includes('500');
-      if (!retry || attempt >= maxRetries) throw error;
-      await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt - 1) + Math.random() * 500));
-    }
-  }
-  throw new Error('Max retries reached');
-}
-
-async function callOpenRouter(messages: OAIMessage[], modelIndex = 0): Promise<string> {
-  const model = CHAT_MODELS[modelIndex % CHAT_MODELS.length];
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+/** Gọi Bytez, trả về toàn bộ response (không streaming) */
+async function callBytez(messages: OAIMessage[]): Promise<string> {
+  const res = await fetch(BYTEZ_ENDPOINT, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages }),
+    headers: { 'Authorization': BYTEZ_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages,
+      stream: false,
+      params: { max_new_tokens: 1024, temperature: 0.7 },
+    }),
   });
-  if (res.status === 429 && modelIndex < CHAT_MODELS.length - 1) {
-    // Rate limit → thử model tiếp theo
-    await new Promise(r => setTimeout(r, 800));
-    return callOpenRouter(messages, modelIndex + 1);
-  }
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || '';
+  if (data.error) throw new Error(data.error);
+  // output có thể là string hoặc array (lấy phần text cuối cùng)
+  const raw = data.output;
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) return raw.map((x: any) => x?.generated_text ?? x?.content ?? x ?? '').join('');
+  return String(raw ?? '');
 }
 
-async function callOpenRouterStream(messages: OAIMessage[], onChunk: (delta: string) => void, modelIndex = 0): Promise<string> {
-  const model = CHAT_MODELS[modelIndex % CHAT_MODELS.length];
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+/** Gọi Bytez với streaming, gọi onChunk mỗi khi có token mới */
+async function callBytezStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
+  const res = await fetch(BYTEZ_ENDPOINT, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, stream: true }),
+    headers: { 'Authorization': BYTEZ_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages,
+      stream: true,
+      params: { max_new_tokens: 1024, temperature: 0.7 },
+    }),
   });
-  if (res.status === 429 && modelIndex < CHAT_MODELS.length - 1) {
-    await new Promise(r => setTimeout(r, 800));
-    return callOpenRouterStream(messages, onChunk, modelIndex + 1);
-  }
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '', fullText = '';
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
+
     for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const payload = line.slice(6);
-      if (payload === '[DONE]') continue;
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const payload = trimmed.slice(6).trim();
+      if (payload === '[DONE]' || !payload) continue;
       try {
-        const delta = JSON.parse(payload).choices?.[0]?.delta?.content || '';
+        const parsed = JSON.parse(payload);
+        // Bytez format: { output: "delta" } hoặc OAI format: { choices: [{delta: {content}}] }
+        const delta =
+          parsed?.output ??
+          parsed?.choices?.[0]?.delta?.content ??
+          parsed?.choices?.[0]?.text ??
+          '';
         if (delta) { fullText += delta; onChunk(delta); }
-      } catch { /* skip */ }
+      } catch { /* skip malformed chunk */ }
     }
   }
+  // Nếu không có gì từ streaming, fallback sang non-streaming
+  if (!fullText) return callBytez(messages);
   return fullText;
 }
 
@@ -268,7 +265,9 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
     (async () => {
       try {
         setInitStage('analyzing');
-        const tone = await withRetry(() => callOpenRouter([{ role: 'user', content: `Đoạn thơ: "${poem}"\nTác giả: ${author}\nChỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha thiết, bi tráng...). Chỉ trả về các từ, không giải thích.` }]));
+        const tone = await callBytez([{ role: 'user', content: `Đoạn thơ: "${poem}"
+Tác giả: ${author}
+Chỉ ra giọng điệu chủ đạo trong 1-3 từ (ví dụ: hào hùng, tha thiết, bi tráng...). Chỉ trả về các từ, không giải thích.` }]);
         const cleanTone = tone.trim() || 'truyền cảm';
         setPoemTone(cleanTone);
 
@@ -286,16 +285,16 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
         const firstId = Date.now().toString();
         setMessages(prev => [...prev, { id: firstId, role: 'model', text: '' }]);
         let full = '';
-        await withRetry(() => callOpenRouterStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+        await callBytezStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
           full += d;
           const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
           setMessages(p => p.map(m => m.id === firstId ? { ...m, text: disp } : m));
           parseMarkup(full);
-        }));
+        });
         chatHistoryRef.current.push({ role: 'assistant', content: full });
       } catch (e: any) {
         let msg = 'Lỗi khởi tạo. Vui lòng thử lại.';
-        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ API key không hợp lệ. Vui lòng kiểm tra lại key trên openrouter.ai/keys';
+        if (e?.status === 401 || e?.message?.includes('401')) msg = '❌ BYTEZ_API_KEY không hợp lệ. Kiểm tra biến VITE_BYTEZ_API_KEY trên Vercel.';
         if (e?.status === 429 || e?.message?.includes('429')) msg = '⏳ Rate limit. Vui lòng thử lại sau ít phút.';
         setMessages([{ id: 'err', role: 'model', text: msg }]);
       } finally { setIsLoading(false); }
@@ -312,16 +311,16 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       setMessages(prev => [...prev, { id: modelId, role: 'model', text: '' }]);
       setIsLoading(false);
       let full = '';
-      await withRetry(() => callOpenRouterStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
+      await callBytezStream([{ role: 'system', content: SYSTEM_PROMPT }, ...chatHistoryRef.current], d => {
         full += d;
         const disp = full.replace(/\[RHYTHM:.*?\]/g, '').replace(/\[HIGHLIGHT:.*?\]/g, '').replace(/\[CLEAR_MARKUP\]/g, '').trim();
         setMessages(p => p.map(m => m.id === modelId ? { ...m, text: disp } : m));
         parseMarkup(full);
-      }));
+      });
       chatHistoryRef.current.push({ role: 'assistant', content: full });
     } catch (e: any) {
       let msg = 'Không thể trả lời lúc này. Vui lòng thử lại.';
-      if (e?.status === 429) msg = '⏳ Rate limit. Vui lòng thử lại sau ít phút.';
+      if (e?.status === 429) msg = '⏳ Đang bận, vui lòng thử lại sau ít phút.';
       setMessages(p => [...p, { id: (Date.now() + 1).toString(), role: 'model', text: msg }]);
       chatHistoryRef.current.pop();
       setIsLoading(false);
