@@ -8,12 +8,11 @@ import { motion, AnimatePresence } from 'motion/react';
 const OPENROUTER_API_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
 const FPT_API_KEY = (import.meta as any).env?.VITE_FPT_API_KEY || '';
 
-// Danh sách model fallback — thử lần lượt khi bị rate limit
+// Model chính: DeepSeek R1 (reasoning, phân tích sắc sảo)
+// Fallback: Llama 3.3 70B khi bị rate limit
 const CHAT_MODELS = [
-  'google/gemma-3-27b-it:free',
-  'meta-llama/llama-3.1-8b-instruct:free',
-  'mistralai/mistral-7b-instruct:free',
-  'qwen/qwen-2.5-7b-instruct:free',
+  'deepseek/deepseek-r1:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
 ];
 // ──────────────────────────────────────────────────────────────────────────
 
