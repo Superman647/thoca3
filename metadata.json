@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Mentor Thẩm Mĩ Thơ Ca",
+  "description": "Ứng dụng AI hướng dẫn học sinh phân tích và giải mã tín hiệu thẩm mĩ trong thơ hiện đại.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
