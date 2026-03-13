@@ -3,9 +3,19 @@ import Markdown from 'react-markdown';
 import { Send, Volume2, Loader2, ArrowLeft, User, Sparkles, BookOpen, X, Square, Activity, Lightbulb, Feather } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-// API key đọc từ biến môi trường Vercel (VITE_OPENROUTER_API_KEY)
+// ── CẤU HÌNH ──────────────────────────────────────────────────────────────
+// Biến môi trường trên Vercel: VITE_OPENROUTER_API_KEY, VITE_FPT_API_KEY
 const OPENROUTER_API_KEY = (import.meta as any).env?.VITE_OPENROUTER_API_KEY || '';
-const CHAT_MODEL = 'google/gemma-3-27b-it:free';
+const FPT_API_KEY = (import.meta as any).env?.VITE_FPT_API_KEY || '';
+
+// Danh sách model fallback — thử lần lượt khi bị rate limit
+const CHAT_MODELS = [
+  'google/gemma-3-27b-it:free',
+  'meta-llama/llama-3.1-8b-instruct:free',
+  'mistralai/mistral-7b-instruct:free',
+  'qwen/qwen-2.5-7b-instruct:free',
+];
+// ──────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Định vị: Bạn là "Mentor Thẩm mĩ Thơ ca", một chuyên gia Văn học và là người dẫn dắt đầy tính sư phạm. Nhiệm vụ của bạn là hướng dẫn học sinh cấp 3 phát hiện và giải mã tín hiệu thẩm mĩ trong thơ hiện đại dựa trên phương pháp tri giác và tư duy ngôn ngữ nghệ thuật.
 
@@ -75,23 +85,34 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, baseDelay = 10
   throw new Error('Max retries reached');
 }
 
-async function callOpenRouter(messages: OAIMessage[]): Promise<string> {
+async function callOpenRouter(messages: OAIMessage[], modelIndex = 0): Promise<string> {
+  const model = CHAT_MODELS[modelIndex % CHAT_MODELS.length];
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: CHAT_MODEL, messages }),
+    body: JSON.stringify({ model, messages }),
   });
+  if (res.status === 429 && modelIndex < CHAT_MODELS.length - 1) {
+    // Rate limit → thử model tiếp theo
+    await new Promise(r => setTimeout(r, 800));
+    return callOpenRouter(messages, modelIndex + 1);
+  }
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';
 }
 
-async function callOpenRouterStream(messages: OAIMessage[], onChunk: (delta: string) => void): Promise<string> {
+async function callOpenRouterStream(messages: OAIMessage[], onChunk: (delta: string) => void, modelIndex = 0): Promise<string> {
+  const model = CHAT_MODELS[modelIndex % CHAT_MODELS.length];
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: CHAT_MODEL, messages, stream: true }),
+    body: JSON.stringify({ model, messages, stream: true }),
   });
+  if (res.status === 429 && modelIndex < CHAT_MODELS.length - 1) {
+    await new Promise(r => setTimeout(r, 800));
+    return callOpenRouterStream(messages, onChunk, modelIndex + 1);
+  }
   if (!res.ok) throw Object.assign(new Error(await res.text()), { status: res.status });
 
   const reader = res.body!.getReader();
@@ -116,17 +137,70 @@ async function callOpenRouterStream(messages: OAIMessage[], onChunk: (delta: str
   return fullText;
 }
 
-// ─── WEB SPEECH TTS ───────────────────────────────────────────────────────
-function speakVI(text: string, onEnd?: () => void) {
+// ─── FPT.AI TTS (tiếng Việt, miễn phí) ──────────────────────────────────
+// Lấy key miễn phí tại: https://console.fpt.ai → Speech → Text to Speech
+// Thêm vào Vercel: VITE_FPT_API_KEY
+// Giọng: banmai (nữ Nam), leminh (nam Nam), thuminh (nữ Bắc), minhquang (nam Bắc)
+const FPT_VOICE = 'banmai';
+
+let currentAudio: HTMLAudioElement | null = null;
+
+async function speakVI(text: string, onEnd?: () => void): Promise<void> {
+  stopSpeech();
+  const clean = text.replace(/\[.*?\]/g, '').replace(/```[\s\S]*?```/g, '').replace(/[*_#`]/g, '').trim();
+  if (!clean) { onEnd?.(); return; }
+
+  // Dùng FPT.AI nếu có key
+  if (FPT_API_KEY) {
+    try {
+      const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
+        method: 'POST',
+        headers: {
+          'api-key': FPT_API_KEY,
+          'voice': FPT_VOICE,
+          'speed': '',        // -3 (chậm) đến 3 (nhanh), '' = mặc định
+          'Content-Type': 'application/json',
+        },
+        body: clean,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.async) {
+          // FPT trả về URL audio, đợi file sẵn rồi phát
+          await new Promise<void>(resolve => setTimeout(resolve, 1200));
+          const audio = new Audio(data.async);
+          currentAudio = audio;
+          audio.onended = () => { currentAudio = null; onEnd?.(); };
+          audio.onerror = () => { currentAudio = null; fallbackSpeak(clean, onEnd); };
+          audio.play();
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('FPT TTS error, fallback to Web Speech', e);
+    }
+  }
+  // Fallback: Web Speech API
+  fallbackSpeak(clean, onEnd);
+}
+
+function fallbackSpeak(text: string, onEnd?: () => void) {
   if (!('speechSynthesis' in window)) { onEnd?.(); return; }
   window.speechSynthesis.cancel();
-  const clean = text.replace(/\[.*?\]/g, '').replace(/```[\s\S]*?```/g, '').replace(/[*_#`]/g, '').trim();
-  const u = new SpeechSynthesisUtterance(clean);
-  u.lang = 'vi-VN'; u.rate = 0.88; u.pitch = 1.05;
+  const u = new SpeechSynthesisUtterance(text);
+  // Tìm giọng tiếng Việt nếu có
+  const voices = window.speechSynthesis.getVoices();
+  const viVoice = voices.find(v => v.lang.startsWith('vi'));
+  if (viVoice) u.voice = viVoice;
+  u.lang = 'vi-VN'; u.rate = 0.85; u.pitch = 1.0;
   if (onEnd) u.onend = onEnd;
   window.speechSynthesis.speak(u);
 }
-const stopSpeech = () => { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); };
+
+function stopSpeech() {
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+}
 // ─────────────────────────────────────────────────────────────────────────
 
 interface Message { id: string; role: 'user' | 'model'; text: string; }
